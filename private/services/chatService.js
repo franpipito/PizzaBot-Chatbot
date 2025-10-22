@@ -152,12 +152,142 @@ async function procesarMensaje(mensajeUsuario) {
     const seccionMenu = construirSeccionMenu(menu);
     const seccionHorarios = construirSeccionHorarios(horarios);
     const promptConversacional = construirPromptConversacional(seccionMenu, seccionHorarios, mensajeValidado);
-    const respuesta = await generarRespuestaGemini(promptConversacional);
+    const respuestaGemini = await generarRespuestaGemini(promptConversacional);
 
-    return respuesta;
+    let respuestaObjeto;
+
+    try {
+      respuestaObjeto = JSON.parse(respuestaGemini);
+    } catch (error) {
+      console.error('La respuesta del modelo no es un JSON válido:', error.message);
+      throw new Error('No se pudo interpretar la respuesta del asistente.');
+    }
+
+    if (!respuestaObjeto || typeof respuestaObjeto !== 'object') {
+      throw new Error('La respuesta del asistente no contiene un objeto JSON válido.');
+    }
+
+    const accion = respuestaObjeto.accion;
+    const parametros = respuestaObjeto.parametros || {};
+
+    switch (accion) {
+      case 'responder_texto': {
+        if (typeof parametros.texto !== 'string') {
+          throw new Error('La acción "responder_texto" requiere un parámetro "texto" válido.');
+        }
+
+        return parametros.texto;
+      }
+      case 'crear_pedido': {
+        const mensajeConfirmacion = await guardarPedidoEnBaseDatos(parametros);
+        return mensajeConfirmacion;
+      }
+      default:
+        throw new Error(`La acción "${accion}" no es reconocida.`);
+    }
   } catch (error) {
     console.error('Error al procesar el mensaje del usuario:', error.message);
     throw error;
+  }
+}
+
+async function guardarPedidoEnBaseDatos(parametros) {
+  let conexion;
+
+  try {
+    conexion = await pool.getConnection();
+    await conexion.beginTransaction();
+
+    const productosParametros = Array.isArray(parametros.productos) ? parametros.productos : [];
+
+    if (productosParametros.length === 0) {
+      throw new Error('No se recibieron productos para crear el pedido.');
+    }
+
+    const datosCliente = parametros.cliente || {};
+    const metodoPago = parametros.metodo_pago || {};
+
+    const nombreCliente = typeof datosCliente.nombre === 'string' ? datosCliente.nombre : null;
+    const informacionCliente = typeof datosCliente.info === 'string' ? datosCliente.info : null;
+    const tipoPago = typeof metodoPago.tipo === 'string' ? metodoPago.tipo : null;
+    const detallesPago = typeof metodoPago.detalles === 'string' ? metodoPago.detalles : null;
+
+    const productosCalculados = [];
+    let montoTotal = 0;
+
+    for (const productoParametro of productosParametros) {
+      if (!productoParametro || typeof productoParametro !== 'object' || !productoParametro.nombre) {
+        throw new Error('Cada producto debe incluir un nombre válido.');
+      }
+
+      const cantidad = Number(productoParametro.cantidad) > 0 ? Number(productoParametro.cantidad) : 1;
+      const nombreProducto = productoParametro.nombre;
+
+      const [filasProducto] = await conexion.query(
+        'SELECT id, precio FROM productos_menu WHERE nombre = ?',
+        [nombreProducto]
+      );
+
+      if (!Array.isArray(filasProducto) || filasProducto.length === 0) {
+        throw new Error(`El producto "${nombreProducto}" no existe en el menú.`);
+      }
+
+      const productoBase = filasProducto[0];
+      const subtotal = productoBase.precio * cantidad;
+      montoTotal += subtotal;
+
+      productosCalculados.push({
+        idProducto: productoBase.id,
+        cantidad,
+        precioUnitario: productoBase.precio,
+        tamano: productoParametro.tamano || null,
+        notas: productoParametro.notas || null,
+      });
+    }
+
+    const [resultadoPedido] = await conexion.query(
+      'INSERT INTO pedidos (nombre_cliente, info_cliente, metodo_pago_tipo, metodo_pago_detalles, monto_total) VALUES (?, ?, ?, ?, ?)',
+      [nombreCliente, informacionCliente, tipoPago, detallesPago, montoTotal]
+    );
+
+    const idPedido = resultadoPedido.insertId;
+
+    if (!idPedido) {
+      throw new Error('No se pudo obtener el identificador del pedido creado.');
+    }
+
+    for (const productoCalculado of productosCalculados) {
+      await conexion.query(
+        'INSERT INTO detalles_pedido (pedido_id, producto_id, cantidad, precio_unitario, tamano, notas) VALUES (?, ?, ?, ?, ?, ?)',
+        [
+          idPedido,
+          productoCalculado.idProducto,
+          productoCalculado.cantidad,
+          productoCalculado.precioUnitario,
+          productoCalculado.tamano,
+          productoCalculado.notas,
+        ]
+      );
+    }
+
+    await conexion.commit();
+
+    return 'Tu pedido fue registrado con éxito. ¡Gracias por elegir La Nona!';
+  } catch (error) {
+    if (conexion) {
+      try {
+        await conexion.rollback();
+      } catch (errorRollback) {
+        console.error('Error al revertir la transacción de pedido:', errorRollback.message);
+      }
+    }
+
+    console.error('Error al guardar el pedido en la base de datos:', error.message);
+    throw error;
+  } finally {
+    if (conexion) {
+      conexion.release();
+    }
   }
 }
 
