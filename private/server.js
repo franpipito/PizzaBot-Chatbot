@@ -10,6 +10,9 @@ const enrutadorChat = require('../private/routes/chatRoutes');
 function crearAplicacion() {
     const aplicacion = express();
     aplicacion.use(express.json());
+    aplicacion.get('/', (_req, res) => {
+        res.status(200).json({ mensaje: 'Servicio PizzaBot operativo' });
+    });
     aplicacion.use('/api/chat', enrutadorChat);
     return aplicacion;
 }
